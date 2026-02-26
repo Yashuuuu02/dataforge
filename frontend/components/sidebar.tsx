@@ -19,6 +19,7 @@ const navigation = [
     { name: "Jobs", href: "/jobs", icon: PlayCircle },
     { name: "Agent", href: "/agent", icon: Bot },
     { name: "Workflows", href: "/workflows", icon: GitBranch },
+    { name: "Fine-Tune", href: "/finetune", icon: Anvil },
     { name: "Settings", href: "/settings", icon: Settings },
 ];
 

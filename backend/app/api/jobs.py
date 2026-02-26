@@ -176,8 +176,63 @@ async def get_job_insight(
     # Force mutation update so JSONB saves
     from sqlalchemy.orm.attributes import flag_modified
     job.config = job_config
-    flag_modified(job, "config")
-    
     await db.commit()
     return report_dict
+
+@router.post("/finetune", response_model=JobResponse)
+async def create_finetune_job(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Dispatch a fine-tune job from the frontend wizard."""
+    # Using raw request to avoid needing a strict schema for FinetuneConfig right now
+    from pydantic import ValidationError
+    data = await request.json()
+    dataset_id = data.get("dataset_id")
+    config = data.get("config", {})
+
+    job = Job(
+        dataset_id=dataset_id,
+        user_id=current_user.id,
+        mode=JobMode.FINETUNE,
+        config={"finetune_config": config},
+        workflow_steps=[], # Abstracted in config for finetune
+        status=JobStatus.QUEUED,
+        started_at=datetime.now(timezone.utc)
+    )
+    db.add(job)
+    await db.flush()
+    await db.refresh(job)
+
+    from pipeline.tasks.finetune import run_finetune_pipeline
+    task = run_finetune_pipeline.delay(str(job.id))
+    job.celery_task_id = task.id
+    
+    await db.commit()
+    return JobResponse.model_validate(job)
+
+@router.get("/{job_id}/finetune-result")
+async def get_finetune_result(
+    job_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Retrieve fine-tune stats and pre-signed minio URLs."""
+    result = await db.execute(select(Job).where(Job.id == job_id, Job.user_id == current_user.id))
+    job = result.scalar_one_or_none()
+    if not job: raise HTTPException(status_code=404)
+    if job.status != JobStatus.COMPLETED: raise HTTPException(status_code=400)
+
+    cfg = job.config or {}
+    keys = cfg.get("minio_keys", {})
+    stats = cfg.get("pipeline_result", {})
+    
+    urls = {}
+    from app.core.minio_client import get_presigned_url
+    if keys.get("train"): urls["train_url"] = get_presigned_url("dataforge-processed", keys["train"])
+    if keys.get("val"): urls["val_url"] = get_presigned_url("dataforge-processed", keys["val"])
+    if keys.get("config"): urls["config_url"] = get_presigned_url("dataforge-processed", keys["config"])
+    
+    return {"stats": stats, "urls": urls}
 
