@@ -154,3 +154,44 @@ async def ws_ingestion_progress(websocket: WebSocket, dataset_id: str):
         await pubsub.unsubscribe(channel)
         await pubsub.close()
         await redis_client.close()
+
+
+@app.websocket("/api/ws/job/{job_id}")
+async def ws_job_progress(websocket: WebSocket, job_id: str):
+    """WebSocket endpoint for real-time job/pipeline progress via Redis pub/sub."""
+    await websocket.accept()
+    logger.info("WebSocket connected for job: %s", job_id)
+
+    redis_client = aioredis.from_url(settings.REDIS_URL)
+    pubsub = redis_client.pubsub()
+    channel = f"job:{job_id}"
+
+    try:
+        await pubsub.subscribe(channel)
+
+        while True:
+            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+            if message and message["type"] == "message":
+                data = message["data"]
+                if isinstance(data, bytes):
+                    data = data.decode("utf-8")
+                await websocket.send_text(data)
+
+                try:
+                    parsed = json.loads(data)
+                    if parsed.get("status") in ("completed", "failed"):
+                        break
+                except json.JSONDecodeError:
+                    pass
+
+            await asyncio.sleep(0.1)
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected for job: %s", job_id)
+    except Exception as exc:
+        logger.error("WebSocket error for job %s: %s", job_id, exc)
+    finally:
+        await pubsub.unsubscribe(channel)
+        await pubsub.close()
+        await redis_client.close()
+

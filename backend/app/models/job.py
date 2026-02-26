@@ -12,6 +12,7 @@ from app.models.base import Base
 
 
 class JobMode(str, enum.Enum):
+    COMMON = "common"
     FINETUNE = "finetune"
     RAG = "rag"
     ML = "ml"

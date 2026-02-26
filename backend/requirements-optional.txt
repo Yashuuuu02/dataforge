@@ -1,0 +1,6 @@
+# Optional heavy dependencies for advanced features
+# Install with: pip install -r requirements-optional.txt
+
+# Semantic deduplication (adds ~1GB to image)
+sentence-transformers==2.7.0
+faiss-cpu==1.8.0
