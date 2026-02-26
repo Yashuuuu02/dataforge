@@ -1,0 +1,22 @@
+FROM python:3.11-slim
+
+WORKDIR /app/backend
+
+# Install system dependencies (incl. tesseract for PDF OCR, libmagic for file detection)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    tesseract-ocr \
+    libmagic1 \
+    poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY backend/ .
+
+# Run Celery worker
+CMD ["celery", "-A", "pipeline.workers.celery_app", "worker", "--loglevel=info", "--concurrency=2"]

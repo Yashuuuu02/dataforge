@@ -1,0 +1,46 @@
+version: "3.8"
+
+# Development overrides — extends docker-compose.yml
+# Usage: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    volumes:
+      - ./backend:/app/backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      APP_ENV: development
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    volumes:
+      - ./backend:/app/backend
+    environment:
+      APP_ENV: development
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    command: npm run dev
+    environment:
+      NODE_ENV: development
+      WATCHPACK_POLLING: "true"
+
+  # Expose debug ports
+  postgres:
+    ports:
+      - "5432:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
