@@ -1,45 +1,136 @@
-"""LiteLLM client for AI agent interactions."""
+"""LiteLLM Client for standardized LLM interaction."""
 
+import asyncio
+import copy
+import json
 import logging
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
-from app.core.config import settings
+import litellm
+from litellm import acompletion
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 logger = logging.getLogger(__name__)
 
+# Drop requests to litellm proxy telemetry
+litellm.telemetry = False
 
 class LiteLLMClient:
-    """Wrapper around LiteLLM for multi-provider LLM access.
+    """Client for interacting with LLM providers using LiteLLM."""
 
-    Full implementation in Phase 2. This stub provides the interface
-    that the agent module will use.
-    """
+    def __init__(self, provider: str, api_key: str, model: str, base_url: Optional[str] = None):
+        self.provider = provider
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url
+        
+        if self.provider == "ollama" and not self.base_url:
+            self.base_url = "http://localhost:11434"
 
-    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
-        self.api_key = api_key or settings.LITELLM_API_KEY
-        self.model = model or settings.LITELLM_MODEL
+    def _prepare_kwargs(self) -> Dict[str, Any]:
+        """Prepare kwargs for litellm.acompletion."""
+        # Format the model string appropriately for LiteLLM
+        model_str = self.model
+        if self.provider not in ("openai", "anthropic") and not model_str.startswith(f"{self.provider}/"):
+            if self.provider == "ollama":
+                model_str = f"ollama/{self.model}"
+            elif self.provider == "groq":
+                model_str = f"groq/{self.model}"
+            elif self.provider == "mistral":
+                model_str = f"mistral/{self.model}"
 
-    async def chat(self, messages: list[dict], temperature: float = 0.7) -> dict:
-        """Send a chat completion request.
-
-        Args:
-            messages: List of message dicts with 'role' and 'content'.
-            temperature: Sampling temperature.
-
-        Returns:
-            Response dict with 'content' and 'usage' keys.
-        """
-        logger.info("LiteLLM chat called with model=%s (stub)", self.model)
-        return {
-            "content": "LLM integration coming in Phase 2.",
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            "model": self.model,
+        kwargs = {
+            "model": model_str,
+            "api_key": self.api_key,
         }
+        if self.base_url:
+            kwargs["api_base"] = self.base_url
+            
+        return kwargs
 
-    async def classify(self, text: str, labels: list[str]) -> dict:
-        """Classify text into one of the given labels. Stub."""
-        return {"label": labels[0] if labels else "unknown", "confidence": 0.0}
+    @retry(
+        retry=retry_if_exception_type((litellm.RateLimitError, litellm.APIConnectionError, litellm.ServiceUnavailableError)),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        stop=stop_after_attempt(5)
+    )
+    async def complete(self, messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = 2000, response_format: Optional[Dict] = None) -> str:
+        """Call the LLM with backoff for rate limits."""
+        kwargs = self._prepare_kwargs()
+        if response_format:
+            kwargs["response_format"] = response_format
 
-    async def generate_schema(self, sample_data: str) -> dict:
-        """Generate a data schema from sample data. Stub."""
-        return {"schema": {}, "status": "placeholder"}
+        response = await acompletion(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **kwargs
+        )
+        return response.choices[0].message.content
+
+    async def complete_batch(self, batch: List[List[Dict[str, str]]], concurrency: int = 5, delay_between: float = 0.5) -> List[str]:
+        """Run multiple completions concurrently with rate limit protection."""
+        sem = asyncio.Semaphore(concurrency)
+        
+        async def _bounded_complete(i: int, msgs: List[Dict[str, str]]) -> tuple[int, str]:
+            async with sem:
+                await asyncio.sleep(delay_between) # Delay to smooth out traffic
+                try:
+                    res = await self.complete(msgs)
+                    return (i, res)
+                except Exception as e:
+                    logger.error(f"Batch item {i} failed: {e}")
+                    return (i, "")
+
+        tasks = [_bounded_complete(i, msgs) for i, msgs in enumerate(batch)]
+        results = await asyncio.gather(*tasks)
+        
+        # Sort by index to maintain original order
+        results.sort(key=lambda x: x[0])
+        return [r[1] for r in results]
+
+    async def complete_json(self, messages: List[Dict[str, str]], schema: Optional[Dict] = None) -> Dict:
+        """Guarantees JSON response — retries if response isn't valid JSON."""
+        # Use litellm JSON mode if supported
+        response_format = {"type": "json_object"} if self.provider in ("openai", "groq", "mistral") else None
+        
+        # Modify system prompt to strongly ask for JSON
+        msgs = copy.deepcopy(messages)
+        if msgs and msgs[0]["role"] == "system":
+            msgs[0]["content"] += "\n\nRespond ONLY with valid JSON."
+
+        for attempt in range(3):
+            try:
+                content = await self.complete(msgs, response_format=response_format, temperature=0.1)
+                
+                # Strip markdown code blocks if present (often LLMs wrap JSON in ```json ... ```)
+                content = content.strip()
+                if content.startswith("```json"):
+                    content = content[7:]
+                if content.startswith("```"):
+                    content = content[3:]
+                if content.endswith("```"):
+                    content = content[:-3]
+                    
+                return json.loads(content.strip())
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse JSON on attempt {attempt+1}. Content: {content[:100]}...")
+                if attempt == 2:
+                    raise ValueError(f"LLM failed to return valid JSON after 3 attempts.")
+                msgs.append({"role": "assistant", "content": content})
+                msgs.append({"role": "user", "content": "That wasn't valid JSON. Please reply with ONLY valid JSON."})
+        return {}
+        
+    def test_connection(self) -> bool:
+        """Makes a minimal API call to verify credentials work."""
+        try:
+            kwargs = self._prepare_kwargs()
+            # Synchronous call just for quick testing
+            response = litellm.completion(
+                messages=[{"role": "user", "content": "Say 'ok'"}],
+                max_tokens=5,
+                **kwargs
+            )
+            return len(response.choices) > 0
+        except Exception as e:
+            logger.error(f"Connection test failed: {e}")
+            return False

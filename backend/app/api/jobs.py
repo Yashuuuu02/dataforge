@@ -132,3 +132,52 @@ async def get_job_result(
         warnings=pipeline_result.get("warnings", []),
         download_url=download_url,
     )
+
+@router.get("/{job_id}/insight")
+async def get_job_insight(
+    job_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get AI or heuristic insight report for a completed job."""
+    result = await db.execute(
+        select(Job).where(Job.id == job_id, Job.user_id == current_user.id)
+    )
+    job = result.scalar_one_or_none()
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status != JobStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="Job is not completed yet")
+
+    # If already stored on job config, return it
+    job_config = job.config or {}
+    if "insight_report" in job_config:
+        return job_config["insight_report"]
+
+    from ai.insight_reporter import InsightReporter
+    from app.api.agent import get_llm_client
+    
+    # Needs to be generated
+    pipeline_result = job_config.get("pipeline_result", {})
+    # In a real app we'd load the dataset analysis here, mock it for now
+    analysis_mock = {"row_count": pipeline_result.get("total_rows_before", 0)}
+
+    llm = get_llm_client(current_user)
+    reporter = InsightReporter(llm)
+    
+    report = await reporter.generate(pipeline_result, analysis_mock, job.mode.value)
+    
+    # Cache it on the job
+    from dataclasses import asdict
+    report_dict = asdict(report)
+    job_config["insight_report"] = report_dict
+    
+    # Force mutation update so JSONB saves
+    from sqlalchemy.orm.attributes import flag_modified
+    job.config = job_config
+    flag_modified(job, "config")
+    
+    await db.commit()
+    return report_dict
+

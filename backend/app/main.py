@@ -94,6 +94,7 @@ from app.api.ingestion import router as ingestion_router
 from app.api.agent import router as agent_router
 from app.api.workflows import router as workflows_router
 from app.api.export import router as export_router
+from app.api.settings import router as settings_router
 
 app.include_router(auth_router, prefix="/api")
 app.include_router(datasets_router, prefix="/api")
@@ -102,6 +103,7 @@ app.include_router(ingestion_router, prefix="/api")
 app.include_router(agent_router, prefix="/api")
 app.include_router(workflows_router, prefix="/api")
 app.include_router(export_router, prefix="/api")
+app.include_router(settings_router, prefix="/api/settings")
 
 
 @app.get("/api/health", tags=["Health"])
